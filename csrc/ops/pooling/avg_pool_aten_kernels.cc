@@ -69,6 +69,83 @@ namespace {
 // CUDA's float accumulator precision (`acc_type<scalar_t, true>`).
 constexpr int64_t k3dSpatialDimCount = 3;
 
+bool HasAsymmetricPadding(const llvm::SmallVectorImpl<int64_t>& padding_vals) {
+  for (size_t i = 0; i < padding_vals.size(); i += 2) {
+    if (padding_vals[i] != padding_vals[i + 1]) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Dynamically computes the `count_include_pad=true` divisor when `ceil_mode`
+// introduces extra out-of-bounds right padding: explicit padding counts as 1s,
+// whereas implicit `ceil_mode` padding counts as 0s.
+absl::StatusOr<mlir::MlirOp> ScaleByCeilModeCountIncludePadDivisor(
+    mlir::MlirOp dividend, mlir::MlirOp batch_input,
+    const llvm::SmallVectorImpl<int64_t>& padding_vals,
+    const ReduceWindowAttributes& reduce_window_attributes,
+    const PoolingWindowParams& window_params) {
+  auto& builder = dividend.getBuilder();
+  const mlir::Type element_type = GetTensorTypeOrDie(dividend).getElementType();
+  const int64_t rank = GetTensorTypeOrDie(batch_input).getRank();
+
+  mlir::MlirOp ones = MakeConstantLike(batch_input, 1, element_type);
+  mlir::MlirOp one_scalar = MakeScalarConstant(builder, 1, element_type);
+  mlir::MlirOp zero_scalar = MakeScalarConstant(builder, 0, element_type);
+
+  Dimensions edge_padding_low(rank, 0);
+  Dimensions edge_padding_high(rank, 0);
+  Dimensions interior_padding(rank, 0);
+
+  llvm::SmallVector<int64_t> reduce_padding;
+  reduce_padding.reserve(rank * 2);
+
+  for (int i = 0; i < rank; ++i) {
+    const int64_t pad_low = padding_vals[2 * i];
+    const int64_t pad_high = padding_vals[2 * i + 1];
+    TT_RET_CHECK(  // ERROR_COV_INFEASIBLE=Expanded padding values are not
+                   // reachable by the user.
+        pad_high >= pad_low, error::kInvalidArgument)
+        << "expected pad_high >= pad_low for implicit ceil_mode padding, got "
+        << pad_high << " vs " << pad_low;
+    const int64_t extra_pad = pad_high - pad_low;
+
+    edge_padding_low[i] = pad_low;
+    edge_padding_high[i] =
+        pad_low;  // Pad both sides symmetrically with explicit padding
+
+    reduce_padding.push_back(0);
+    reduce_padding.push_back(
+        extra_pad);  // ReduceWindow handles the extra implicit padding
+  }
+
+  mlir::MlirOp padded_ones = mlir::stablehlo::Pad(
+      ones, one_scalar, edge_padding_low, edge_padding_high, interior_padding);
+  padded_ones = PadDynamicCeilModeSpatialDims(padded_ones, zero_scalar,
+                                              batch_input, window_params);
+
+  auto add_reduce_builder = [element_type](mlir::RegionBuilder& rb) {
+    mlir::stablehlo::buildReduceBody<mlir::stablehlo::AddOp>(
+        element_type, rb.getRegion(), rb.getOpBuilder());
+  };
+
+  auto reduce_padding_attr = mlir::DenseIntElementsAttr::get(
+      mlir::makeTensorType(builder.getContext(), {rank, 2},
+                           builder.getOpBuilder().getI64Type()),
+      reduce_padding);
+
+  mlir::MlirOp divisor = mlir::stablehlo::ReduceWindow(
+      builder,
+      /*inputs=*/{padded_ones},
+      /*init_values=*/{zero_scalar},
+      /*body=*/add_reduce_builder, reduce_window_attributes.window_dimensions,
+      reduce_window_attributes.window_strides,
+      reduce_window_attributes.base_dilations,
+      reduce_window_attributes.window_dilations, reduce_padding_attr)[0];
+  return mlir::stablehlo::Div(dividend, divisor);
+}
+
 // Scales the output of the pooling reduction (sum) by the divisor.
 //
 // For floating point element types with a constant divisor, we multiply by the
@@ -78,12 +155,15 @@ constexpr int64_t k3dSpatialDimCount = 3;
 // count_include_pad is false), we compute the per-window count tensor and
 // divide.
 absl::StatusOr<mlir::MlirOp> ScaleAvgPoolOutput(
-    mlir::MlirOp dividend, const mlir::RankedTensorType& input_type,
+    mlir::MlirOp dividend, mlir::MlirOp batch_input,
     const ReduceWindowAttributes& reduce_window_attributes,
-    bool count_include_pad, std::optional<int64_t> divisor_override) {
+    const PoolingWindowParams& window_params, const bool count_include_pad,
+    const std::optional<int64_t> divisor_override) {
   auto& builder = dividend.getBuilder();
   const mlir::RankedTensorType dividend_type = GetTensorTypeOrDie(dividend);
   const mlir::Type element_type = dividend_type.getElementType();
+  const mlir::RankedTensorType batch_input_type =
+      GetTensorTypeOrDie(batch_input);
 
   // Helper to scale dividend by a constant integer divisor.
   auto scale_by_constant_divisor = [&]  // REF_CAPTURE_OK=called synchronously
@@ -111,18 +191,10 @@ absl::StatusOr<mlir::MlirOp> ScaleAvgPoolOutput(
     auto padding_attr = reduce_window_attributes.padding.getValues<int64_t>();
     llvm::SmallVector<int64_t> padding_vals(padding_attr.begin(),
                                             padding_attr.end());
-    bool has_extra_padding = false;
-
-    // Check for asymmetric padding (extra padding on the right added by
-    // ceil_mode)
-    for (size_t i = 0; i < padding_vals.size(); i += 2) {
-      if (padding_vals[i] != padding_vals[i + 1]) {
-        has_extra_padding = true;
-        break;
-      }
-    }
-
-    if (!has_extra_padding) {
+    const bool has_extra_padding = HasAsymmetricPadding(padding_vals);
+    const bool has_dynamic_ceil_pad =
+        HasDynamicCeilModePadding(batch_input_type, window_params);
+    if (!has_extra_padding && !has_dynamic_ceil_pad) {
       // Fast path: Symmetric padding, window size is constant.
       const int64_t window_size = std::accumulate(
           reduce_window_attributes.window_dimensions.asArrayRef().begin(),
@@ -130,72 +202,17 @@ absl::StatusOr<mlir::MlirOp> ScaleAvgPoolOutput(
           int64_t{1}, std::multiplies<int64_t>());
       return scale_by_constant_divisor(window_size);
     }
-
-    // Dynamically compute divisor: explicitly padded regions count as 1s,
-    // but the extra out-of-bounds padding created by ceil_mode counts as 0s.
-    mlir::MlirOp ones =
-        MakeConstant(builder, 1, element_type, input_type.getShape());
-    mlir::MlirOp one_scalar = MakeScalarConstant(builder, 1, element_type);
-    mlir::MlirOp zero_scalar = MakeScalarConstant(builder, 0, element_type);
-
-    const int64_t rank = input_type.getRank();
-    Dimensions edge_padding_low(rank, 0);
-    Dimensions edge_padding_high(rank, 0);
-    Dimensions interior_padding(rank, 0);
-
-    llvm::SmallVector<int64_t> reduce_padding;
-    reduce_padding.reserve(rank * 2);
-
-    for (int i = 0; i < rank; ++i) {
-      const int64_t pad_low = padding_vals[2 * i];
-      const int64_t pad_high = padding_vals[2 * i + 1];
-      TT_RET_CHECK(  // ERROR_COV_INFEASIBLE=Expanded padding values are not
-                     // reachable by the user.
-          pad_high >= pad_low, error::kInvalidArgument)
-          << "expected pad_high >= pad_low for implicit ceil_mode padding, "
-             "got "
-          << pad_high << " vs " << pad_low;
-      const int64_t extra_pad = pad_high - pad_low;
-
-      edge_padding_low[i] = pad_low;
-      edge_padding_high[i] =
-          pad_low;  // Pad both sides symmetrically with explicit padding
-
-      reduce_padding.push_back(0);
-      reduce_padding.push_back(
-          extra_pad);  // ReduceWindow handles the extra implicit padding
-    }
-
-    mlir::MlirOp padded_ones =
-        mlir::stablehlo::Pad(ones, one_scalar, edge_padding_low,
-                             edge_padding_high, interior_padding);
-
-    auto add_reduce_builder = [element_type](mlir::RegionBuilder& rb) {
-      mlir::stablehlo::buildReduceBody<mlir::stablehlo::AddOp>(
-          element_type, rb.getRegion(), rb.getOpBuilder());
-    };
-
-    auto reduce_padding_attr = mlir::DenseIntElementsAttr::get(
-        mlir::makeTensorType(builder.getContext(), {rank, 2},
-                             builder.getOpBuilder().getI64Type()),
-        reduce_padding);
-
-    mlir::MlirOp divisor = mlir::stablehlo::ReduceWindow(
-        builder,
-        /*inputs=*/{padded_ones},
-        /*init_values=*/{zero_scalar},
-        /*body=*/add_reduce_builder, reduce_window_attributes.window_dimensions,
-        reduce_window_attributes.window_strides,
-        reduce_window_attributes.base_dilations,
-        reduce_window_attributes.window_dilations, reduce_padding_attr)[0];
-    return mlir::stablehlo::Div(dividend, divisor);
+    return ScaleByCeilModeCountIncludePadDivisor(
+        dividend, batch_input, padding_vals, reduce_window_attributes,
+        window_params);
   }
 
   // Case C: Count does not include padding, so divisor is the number of the
   // elements in the output
-  mlir::MlirOp ones =
-      MakeConstant(builder, 1, element_type, input_type.getShape());
+  mlir::MlirOp ones = MakeConstantLike(batch_input, 1, element_type);
   mlir::MlirOp init_value = MakeScalarConstant(builder, 0, element_type);
+  ones = PadDynamicCeilModeSpatialDims(ones, init_value, batch_input,
+                                       window_params);
 
   auto add_reduce_builder = [element_type](mlir::RegionBuilder& rb) {
     mlir::stablehlo::buildReduceBody<mlir::stablehlo::AddOp>(
@@ -253,9 +270,16 @@ absl::StatusOr<mlir::MlirOp> BuildAvgPoolShlo(
                         ExpandAttribute(padding, spatial_dim_count));
   }
   Dimensions dilation_attr(spatial_dim_count, 1);
+  const PoolingWindowParams window_params{
+      .kernel_size = kernel_size_attr,
+      .stride = stride_attr,
+      .padding = padding_attr,
+      .dilation = dilation_attr,
+      .ceil_mode = ceil_mode,
+  };
 
   // 3. Compute the padding pairs given the padding and ceil mode.
-  auto ceil_padding_pairs =
+  const auto ceil_padding_pairs =
       CeilModePadding(input_type, kernel_size_attr, stride_attr, padding_attr,
                       dilation_attr, ceil_mode);
 
@@ -266,6 +290,8 @@ absl::StatusOr<mlir::MlirOp> BuildAvgPoolShlo(
 
   // 5. Compute the avg_pool using a single ReduceWindow.
   mlir::MlirOp init_value = MakeScalarConstant(builder, 0, element_type);
+  mlir::MlirOp padded_input = PadDynamicCeilModeSpatialDims(
+      batch_input, init_value, batch_input, window_params);
 
   auto add_reduce_builder = [element_type](mlir::RegionBuilder& rb) {
     mlir::stablehlo::buildReduceBody<mlir::stablehlo::AddOp>(
@@ -274,7 +300,7 @@ absl::StatusOr<mlir::MlirOp> BuildAvgPoolShlo(
 
   mlir::MlirOp sum_output = mlir::stablehlo::ReduceWindow(
       builder,
-      /*inputs=*/{batch_input},
+      /*inputs=*/{padded_input},
       /*init_values=*/{init_value},
       /*body=*/add_reduce_builder, reduce_window_attributes.window_dimensions,
       reduce_window_attributes.window_strides,
@@ -284,8 +310,8 @@ absl::StatusOr<mlir::MlirOp> BuildAvgPoolShlo(
 
   TT_ASSIGN_OR_RETURN(
       auto final_output,
-      ScaleAvgPoolOutput(sum_output, input_type, reduce_window_attributes,
-                         count_include_pad, divisor_override));
+      ScaleAvgPoolOutput(sum_output, batch_input, reduce_window_attributes,
+                         window_params, count_include_pad, divisor_override));
 
   auto result =
       RemoveTrivialBatch(final_output, original_dim_size, spatial_dim_count);
@@ -335,30 +361,32 @@ absl::StatusOr<mlir::MlirOp> BuildAvgPoolShlo(
 //    the original input shape.
 mlir::MlirOp SliceBackwardResult(
     mlir::MlirOp full_conv_result, mlir::MlirOp init_value,
-    const mlir::RankedTensorType& input_type,
+    mlir::MlirOp batch_input,
     const std::vector<PaddingParams>& ceil_padding_pairs, int64_t num_dims,
     int64_t spatial_dim_count) {
   Dimensions start_indices(num_dims, 0);
   Dimensions limit_indices(num_dims, 0);
   Dimensions slice_strides(num_dims, 1);
 
-  const auto conv_shape = GetTensorTypeOrDie(full_conv_result).getShape();
+  const mlir::RankedTensorType input_type = GetTensorTypeOrDie(batch_input);
+  const Dimensions static_input_shape = GetStaticShape(batch_input);
+  const Dimensions conv_bounds = GetStaticShape(full_conv_result);
   Dimensions result_pad_high(num_dims, 0);
   bool needs_padding = false;
 
   for (int i = 0; i < num_dims; ++i) {
     if (i < num_dims - spatial_dim_count) {  // Batch/Channel dims
       start_indices[i] = 0;
-      limit_indices[i] = input_type.getShape()[i];
+      limit_indices[i] = static_input_shape[i];
     } else {  // Spatial dims
       const int spatial_idx = i - (num_dims - spatial_dim_count);
       const int64_t fwd_pad_low = ceil_padding_pairs[spatial_idx].left;
       start_indices[i] = fwd_pad_low;
-      limit_indices[i] = fwd_pad_low + input_type.getShape()[i];
+      limit_indices[i] = fwd_pad_low + static_input_shape[i];
 
       // If the limit is out of bounds, we need to pad the result.
-      if (limit_indices[i] > conv_shape[i]) {
-        result_pad_high[i] = limit_indices[i] - conv_shape[i];
+      if (limit_indices[i] > conv_bounds[i]) {
+        result_pad_high[i] = limit_indices[i] - conv_bounds[i];
         needs_padding = true;
       }
     }
@@ -374,8 +402,30 @@ mlir::MlirOp SliceBackwardResult(
                              /*interior=*/Dimensions(num_dims, 0));
   }
 
-  return mlir::stablehlo::Slice(slicable_result, start_indices, limit_indices,
-                                slice_strides);
+  const mlir::RankedTensorType conv_type = GetTensorTypeOrDie(slicable_result);
+  auto& builder = batch_input.getBuilder();
+  const mlir::Type i32_type = builder.getOpBuilder().getI32Type();
+  for (int64_t dim = 0; dim < num_dims; ++dim) {
+    if (conv_type.isDynamicDim(dim)) {
+      mlir::MlirOp bound_op =
+          MakeScalarConstant(builder, conv_bounds[dim], i32_type);
+      slicable_result =
+          mlir::stablehlo::SetDimensionSize(slicable_result, bound_op, dim);
+    }
+  }
+
+  mlir::MlirOp sliced = mlir::stablehlo::Slice(slicable_result, start_indices,
+                                               limit_indices, slice_strides);
+
+  for (int64_t dim = 0; dim < num_dims; ++dim) {
+    if (input_type.isDynamicDim(dim)) {
+      mlir::MlirOp orig_size =
+          mlir::stablehlo::GetDimensionSize(batch_input, dim);
+      sliced = mlir::stablehlo::SetDimensionSize(sliced, orig_size, dim);
+    }
+  }
+
+  return sliced;
 }
 
 absl::StatusOr<mlir::MlirOp> BuildAvgPoolBackwardShlo(
@@ -416,9 +466,16 @@ absl::StatusOr<mlir::MlirOp> BuildAvgPoolBackwardShlo(
                         ExpandAttribute(padding, spatial_dim_count));
   }
   Dimensions dilation_attr(spatial_dim_count, 1);
+  const PoolingWindowParams window_params{
+      .kernel_size = kernel_size_attr,
+      .stride = stride_attr,
+      .padding = padding_attr,
+      .dilation = dilation_attr,
+      .ceil_mode = ceil_mode,
+  };
 
   // 3. Compute the padding pairs given the padding and ceil mode.
-  auto ceil_padding_pairs =
+  const auto ceil_padding_pairs =
       CeilModePadding(input_type, kernel_size_attr, stride_attr, padding_attr,
                       dilation_attr, ceil_mode);
 
@@ -428,10 +485,52 @@ absl::StatusOr<mlir::MlirOp> BuildAvgPoolBackwardShlo(
       spatial_dim_count, num_dims);
 
   // 5. Normalize grad_output by the divisor.
-  TT_ASSIGN_OR_RETURN(auto normalized_grad_output,
-                      ScaleAvgPoolOutput(batch_grad_output, input_type,
-                                         reduce_window_attributes,
-                                         count_include_pad, divisor_override));
+  TT_ASSIGN_OR_RETURN(
+      auto normalized_grad_output,
+      ScaleAvgPoolOutput(batch_grad_output, batch_input,
+                         reduce_window_attributes, window_params,
+                         count_include_pad, divisor_override));
+
+  // Mask out of bounds elements of normalized_grad_output to 0 and lift to
+  // static bounds before ReduceWindow.
+  const mlir::RankedTensorType grad_type =
+      GetTensorTypeOrDie(normalized_grad_output);
+  const Dimensions grad_bounds = GetStaticShape(normalized_grad_output);
+  const mlir::Type i32_type = builder.getOpBuilder().getI32Type();
+  const mlir::RankedTensorType static_i32_type =
+      mlir::RankedTensorType::get(grad_bounds, i32_type);
+
+  std::optional<mlir::MlirOp> in_bounds_mask;
+  for (int64_t dim = 0; dim < num_dims; ++dim) {
+    if (!grad_type.isDynamicDim(dim)) {
+      continue;
+    }
+    mlir::MlirOp cur_size =
+        mlir::stablehlo::GetDimensionSize(normalized_grad_output, dim);
+    mlir::MlirOp idx = mlir::stablehlo::Iota(builder, static_i32_type, dim);
+    mlir::MlirOp size_bcast = mlir::stablehlo::BroadcastInDim(
+        static_i32_type, cur_size, /*broadcast_dimensions=*/{});
+    mlir::MlirOp dim_in_bounds = mlir::stablehlo::Compare(
+        idx, size_bcast, mlir::stablehlo::ComparisonDirection::LT);
+    in_bounds_mask = in_bounds_mask.has_value()
+                         ? mlir::stablehlo::And(*in_bounds_mask, dim_in_bounds)
+                         : dim_in_bounds;
+  }
+
+  for (int64_t dim = 0; dim < num_dims; ++dim) {
+    if (grad_type.isDynamicDim(dim)) {
+      mlir::MlirOp bound_op =
+          MakeScalarConstant(builder, grad_bounds[dim], i32_type);
+      normalized_grad_output = mlir::stablehlo::SetDimensionSize(
+          normalized_grad_output, bound_op, dim);
+    }
+  }
+
+  if (in_bounds_mask.has_value()) {
+    mlir::MlirOp zero = MakeConstantLike(normalized_grad_output, 0);
+    normalized_grad_output =
+        mlir::stablehlo::Select(*in_bounds_mask, normalized_grad_output, zero);
+  }
 
   // 6. Perform transposed convolution with interior/edge padding
   auto bw_window_dimensions = reduce_window_attributes.window_dimensions;
@@ -481,7 +580,7 @@ absl::StatusOr<mlir::MlirOp> BuildAvgPoolBackwardShlo(
 
   // 7. Slice out the region corresponding to the original input shape
   auto sliced_grad =
-      SliceBackwardResult(full_conv_result, init_value, input_type,
+      SliceBackwardResult(full_conv_result, init_value, batch_input,
                           ceil_padding_pairs, num_dims, spatial_dim_count);
 
   auto result = RemoveTrivialBatch(

@@ -15147,6 +15147,122 @@ class OpsUnitTest(TorchTpuVsCpuTestBase):
 
       self.assert_close_tpu_vs_cpu(compute)
 
+  def test_lcm_int64_loop_ir_and_bounded_dynamism(self):
+    """Tests int64 lcm avoids 64-bit div/rem expansion and supports dynamism."""
+    a_ir = torch.tensor([12, 0], dtype=torch.int64, device="tpu")
+    b_ir = torch.tensor([18, 5], dtype=torch.int64, device="tpu")
+    with execution_mode.set_eager_mode(
+        execution_mode.EagerMode._INTERNAL_COMPILE_FX_GRAPH
+    ):
+      out_ir = torch.lcm(a_ir, b_ir)
+    mlir_text = tpu_torch_compile.serialize_mlir_text(
+        tpu_torch_compile.build_mlir([out_ir], [a_ir, b_ir])
+    )
+    self.assertIn("stablehlo.while", mlir_text)
+    self.assertIn("stablehlo.popcnt", mlir_text)
+    self.assertIn("stablehlo.reduce", mlir_text)
+    self.assertNotIn("stablehlo.remainder", mlir_text)
+    self.assertNotIn("stablehlo.divide", mlir_text)
+
+    s1_ir = torch.tensor(12, dtype=torch.int64, device="tpu")
+    s2_ir = torch.tensor(18, dtype=torch.int64, device="tpu")
+    with execution_mode.set_eager_mode(
+        execution_mode.EagerMode._INTERNAL_COMPILE_FX_GRAPH
+    ):
+      scalar_out_ir = torch.lcm(s1_ir, s2_ir)
+    scalar_mlir_text = tpu_torch_compile.serialize_mlir_text(
+        tpu_torch_compile.build_mlir([scalar_out_ir], [s1_ir, s2_ir])
+    )
+    self.assertIn("stablehlo.while", scalar_mlir_text)
+    self.assertIn("stablehlo.popcnt", scalar_mlir_text)
+    self.assertNotIn("stablehlo.reduce", scalar_mlir_text)
+    self.assertNotIn("stablehlo.remainder", scalar_mlir_text)
+    self.assertNotIn("stablehlo.divide", scalar_mlir_text)
+
+    a_i32_ir = torch.tensor([12, 0], dtype=torch.int32, device="tpu")
+    b_i32_ir = torch.tensor([18, 5], dtype=torch.int32, device="tpu")
+    with execution_mode.set_eager_mode(
+        execution_mode.EagerMode._INTERNAL_COMPILE_FX_GRAPH
+    ):
+      out_i32_ir = torch.lcm(a_i32_ir, b_i32_ir)
+    i32_mlir_text = tpu_torch_compile.serialize_mlir_text(
+        tpu_torch_compile.build_mlir([out_i32_ir], [a_i32_ir, b_i32_ir])
+    )
+    self.assertIn("stablehlo.remainder", i32_mlir_text)
+    self.assertIn("stablehlo.divide", i32_mlir_text)
+
+    full_a = torch.tensor(
+        [
+            [0, 0, -12, 2**63 - 1],
+            [-(2**63), 1836311903, -(2**63), -(2**63 - 1)],
+            [15, -(2**63), -3037000493, 2**63 - 2],
+            [42, 0, -24, (2**63 - 1) // 73],
+        ],
+        dtype=torch.int64,
+    )
+    full_b = torch.tensor(
+        [
+            [0, 42, 18, 7],
+            [1, 2971215073, 2, 49],
+            [25, -(2**63), 3037000499, -6],
+            [0, 17, -36, 73],
+        ],
+        dtype=torch.int64,
+    )
+    compiled_lcm = torch.compile(torch.lcm, backend="tpu")
+    for rows in (2, 4):
+      a_cpu = full_a[:rows].clone()
+      b_cpu = full_b[:rows].clone()
+      a_tpu = a_cpu.to("tpu")
+      b_tpu = b_cpu.to("tpu")
+      dynamism.mark_dynamic(a_tpu, dimension=0, lower_bound=2, upper_bound=8)
+      dynamism.mark_dynamic(b_tpu, dimension=0, lower_bound=2, upper_bound=8)
+      self.assertEqual(
+          torch.lcm(a_tpu, b_tpu).cpu().tolist(),
+          torch.lcm(a_cpu, b_cpu).tolist(),
+      )
+      scalar_six_tpu = torch.tensor(6, dtype=torch.int64, device="tpu")
+      scalar_six_cpu = torch.tensor(6, dtype=torch.int64)
+      a_bcast = a_cpu.to("tpu")
+      dynamism.mark_dynamic(a_bcast, dimension=0, lower_bound=2, upper_bound=8)
+      self.assertEqual(
+          torch.lcm(a_bcast, scalar_six_tpu).cpu().tolist(),
+          torch.lcm(a_cpu, scalar_six_cpu).tolist(),
+      )
+
+      a_comp = a_cpu.to("tpu")
+      b_comp = b_cpu.to("tpu")
+      if rows == 2:
+        torch._dynamo.mark_dynamic(a_comp, 0)
+        torch._dynamo.mark_dynamic(b_comp, 0)
+        comp_out = compiled_lcm(a_comp, b_comp)
+      else:
+        with torch._dynamo.config.patch(error_on_recompile=True):
+          comp_out = compiled_lcm(a_comp, b_comp)
+      self.assertEqual(
+          comp_out.cpu().tolist(),
+          torch.lcm(a_cpu, b_cpu).tolist(),
+      )
+
+    for scalar_a_val, scalar_b_val in (
+        (12, 18),
+        (0, -5),
+        (2**63 - 1, 7),
+        (-(2**63), 2),
+    ):
+      scalar_a_cpu = torch.tensor(scalar_a_val, dtype=torch.int64)
+      scalar_b_cpu = torch.tensor(scalar_b_val, dtype=torch.int64)
+      scalar_tpu_out = torch.lcm(scalar_a_cpu.to("tpu"), scalar_b_cpu.to("tpu"))
+      self.assertEqual(scalar_tpu_out.ndim, 0)
+      self.assertEqual(
+          scalar_tpu_out.cpu().item(),
+          torch.lcm(scalar_a_cpu, scalar_b_cpu).item(),
+      )
+
+    empty_cpu = torch.empty((0, 3), dtype=torch.int64)
+    empty_out = torch.lcm(empty_cpu.to("tpu"), empty_cpu.to("tpu"))
+    self.assertEqual(tuple(empty_out.shape), (0, 3))
+
   def test_var_empty_reduction_dim(self):
     """Tests 0-sized reduction with negative correction returns NaN (b/568045113)."""
 
@@ -20569,6 +20685,114 @@ class OpsGradUnitTest(TorchTpuVsCpuTestBase):
             padding=1,
             count_include_pad=False,
         )
+    )
+
+  def test_avg_pool2d_bounded_dynamism_ceil_mode(self):
+    """Tests compiled avg_pool2d with ceil_mode=True on bounded dynamic dims."""
+    torch.manual_seed(42)
+    device = torch.device("tpu")
+
+    def pool_stride1(x):
+      return torch.nn.functional.avg_pool2d(
+          x,
+          kernel_size=3,
+          stride=1,
+          padding=1,
+          ceil_mode=True,
+          count_include_pad=False,
+      )
+
+    compiled_s1 = torch.compile(pool_stride1, backend="tpu", dynamic=None)
+    x_first = torch.randn(1, 3, 9, 9, dtype=torch.float64)
+    x_first_tpu = x_first.to(device)
+    torch._dynamo.mark_dynamic(x_first_tpu, 2, min=4, max=12)
+    self.assert_close(
+        golden_result=pool_stride1(x_first),
+        torch_tpu_result=compiled_s1(x_first_tpu).cpu(),
+    )
+
+    x_second = torch.randn(1, 3, 6, 9, dtype=torch.float64)
+    with torch._dynamo.config.patch(error_on_recompile=True):
+      out_second = compiled_s1(x_second.to(device))
+    self.assert_close(
+        golden_result=pool_stride1(x_second),
+        torch_tpu_result=out_second.cpu(),
+    )
+
+    def pool_asym_pad(x):
+      return torch.nn.functional.avg_pool2d(
+          x,
+          kernel_size=3,
+          stride=2,
+          padding=1,
+          ceil_mode=True,
+          count_include_pad=True,
+      )
+
+    compiled_asym = torch.compile(pool_asym_pad, backend="tpu", dynamic=None)
+    b_first = torch.randn(3, 2, 6, 6, dtype=torch.float32)
+    b_first_tpu = b_first.to(device)
+    torch._dynamo.mark_dynamic(b_first_tpu, 0, min=2, max=8)
+    self.assert_close(
+        golden_result=pool_asym_pad(b_first),
+        torch_tpu_result=compiled_asym(b_first_tpu).cpu(),
+    )
+
+    b_second = torch.randn(5, 2, 6, 6, dtype=torch.float32)
+    with torch._dynamo.config.patch(error_on_recompile=True):
+      out_b_second = compiled_asym(b_second.to(device))
+    self.assert_close(
+        golden_result=pool_asym_pad(b_second),
+        torch_tpu_result=out_b_second.cpu(),
+    )
+
+    compiled_spatial_s2 = torch.compile(
+        pool_asym_pad, backend="tpu", dynamic=None
+    )
+    h_first = torch.randn(1, 2, 7, 6, dtype=torch.float32)
+    h_first_tpu = h_first.to(device)
+    torch._dynamo.mark_dynamic(h_first_tpu, 2)
+    self.assert_close(
+        golden_result=pool_asym_pad(h_first),
+        torch_tpu_result=compiled_spatial_s2(h_first_tpu).cpu(),
+    )
+
+    h_second = torch.randn(1, 2, 6, 6, dtype=torch.float32)
+    with torch._dynamo.config.patch(error_on_recompile=True):
+      out_h_second = compiled_spatial_s2(h_second.to(device))
+    self.assert_close(
+        golden_result=pool_asym_pad(h_second),
+        torch_tpu_result=out_h_second.cpu(),
+    )
+
+    def pool_both_spatial_dynamic(x):
+      return torch.nn.functional.avg_pool2d(
+          x,
+          kernel_size=3,
+          stride=2,
+          padding=1,
+          ceil_mode=True,
+          count_include_pad=False,
+      )
+
+    compiled_spatial_both = torch.compile(
+        pool_both_spatial_dynamic, backend="tpu", dynamic=None
+    )
+    hw_first = torch.randn(1, 2, 7, 7, dtype=torch.float32)
+    hw_first_tpu = hw_first.to(device)
+    torch._dynamo.mark_dynamic(hw_first_tpu, 2)
+    torch._dynamo.mark_dynamic(hw_first_tpu, 3)
+    self.assert_close(
+        golden_result=pool_both_spatial_dynamic(hw_first),
+        torch_tpu_result=compiled_spatial_both(hw_first_tpu).cpu(),
+    )
+
+    hw_second = torch.randn(1, 2, 6, 8, dtype=torch.float32)
+    with torch._dynamo.config.patch(error_on_recompile=True):
+      out_hw_second = compiled_spatial_both(hw_second.to(device))
+    self.assert_close(
+        golden_result=pool_both_spatial_dynamic(hw_second),
+        torch_tpu_result=out_hw_second.cpu(),
     )
 
   def test_adaptive_avg_pool_corner_cases(self):

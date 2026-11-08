@@ -69,6 +69,7 @@
 #include "stablehlo/integrations/cpp/builder/MlirBuilder.h"
 #include "stablehlo/integrations/cpp/builder/StablehloBuilder.h"
 #include "torch/csrc/autograd/custom_function.h"
+#include "torch/csrc/autograd/function_hook.h"
 #include "torch/headeronly/core/ScalarType.h"
 
 namespace torch_tpu {
@@ -196,7 +197,7 @@ absl::StatusOr<std::vector<mlir::MlirOp>> ComputeMaxPoolWithIndices(
 absl::StatusOr<mlir::MlirOp> ComputeMaxPool(
     const BatchInput& batch_input_info,
     const ReduceWindowAttributes& reduce_window_attributes,
-    const int64_t spatial_dim_count) {
+    const PoolingWindowParams& window_params, const int64_t spatial_dim_count) {
   mlir::MlirOp batch_input = batch_input_info.batch_input;
   const int64_t original_dim_size = batch_input_info.original_dim_size;
 
@@ -209,10 +210,12 @@ absl::StatusOr<mlir::MlirOp> ComputeMaxPool(
   mlir::DenseElementsAttr init_value_attr = mlir::DenseElementsAttr::get(
       mlir::RankedTensorType::get({}, element_type), val_attr);
   mlir::MlirOp init_value = mlir::stablehlo::Constant(builder, init_value_attr);
+  mlir::MlirOp padded_input = PadDynamicCeilModeSpatialDims(
+      batch_input, init_value, batch_input, window_params);
 
   auto reduce_results = mlir::stablehlo::ReduceWindow(
       builder,
-      /*inputs=*/{batch_input},
+      /*inputs=*/{padded_input},
       /*init_values=*/{init_value},
       /*body=*/
       [&](mlir::RegionBuilder& rb) {  // REF_CAPTURE_OK=called synchronously
@@ -306,7 +309,7 @@ absl::StatusOr<std::vector<mlir::MlirOp>> BuildMaxPoolWithIndicesShlo(
   }
 
   // STEP 3. Compute the padding pairs given the padding and ceil mode.
-  auto ceil_padding_pairs =
+  const auto ceil_padding_pairs =
       CeilModePadding(input_shape, kernel_size_attr, stride_attr, padding_attr,
                       dilation_attr, ceil_mode);
 
@@ -360,8 +363,15 @@ absl::StatusOr<mlir::MlirOp> BuildMaxPoolShlo(
     TT_ASSIGN_OR_RETURN(padding_attr,
                         ExpandAttribute(padding, spatial_dim_count));
   }
+  const PoolingWindowParams window_params{
+      .kernel_size = kernel_size_attr,
+      .stride = stride_attr,
+      .padding = padding_attr,
+      .dilation = dilation_attr,
+      .ceil_mode = ceil_mode,
+  };
 
-  auto ceil_padding_pairs =
+  const auto ceil_padding_pairs =
       CeilModePadding(input_shape, kernel_size_attr, stride_attr, padding_attr,
                       dilation_attr, ceil_mode);
 
@@ -370,7 +380,7 @@ absl::StatusOr<mlir::MlirOp> BuildMaxPoolShlo(
       spatial_dim_count, total_num_dims);
 
   return ComputeMaxPool(batch_input_info, reduce_window_attributes,
-                        spatial_dim_count);
+                        window_params, spatial_dim_count);
 }
 
 // Tracks spatial tail slicing applied before `SelectAndScatter` in `max_pool`
@@ -405,6 +415,7 @@ UncoveredTailSliceInfo SliceUncoveredSpatialTail(
   const mlir::RankedTensorType grad_output_shape =
       GetTensorTypeOrDie(batch_grad_output);
   const int64_t total_num_dims = input_shape.getRank();
+  const Dimensions static_shape = GetStaticShape(batch_input);
 
   UncoveredTailSliceInfo info{
       .operand = batch_input,
@@ -413,10 +424,11 @@ UncoveredTailSliceInfo SliceUncoveredSpatialTail(
   };
 
   Dimensions slice_starts(total_num_dims, 0);
-  Dimensions slice_limits = CopyIntVector(input_shape.getShape());
+  Dimensions slice_limits = static_shape;
   Dimensions slice_strides(total_num_dims, 1);
 
   for (int64_t i = 0; i < spatial_dim_count; ++i) {
+    if (input_shape.isDynamicDim(2 + i)) continue;
     const int64_t input_size = input_shape.getDimSize(2 + i);
     const int64_t out_size = grad_output_shape.getDimSize(2 + i);
     if (out_size <= 0) continue;
@@ -567,13 +579,62 @@ absl::StatusOr<mlir::MlirOp> BuildMaxPoolBackwardShlo(
   };
 
   // STEP 7. Perform SelectAndScatter
+  const PoolingWindowParams window_params{
+      .kernel_size = kernel_size_attr,
+      .stride = stride_attr,
+      .padding = padding_attr,
+      .dilation = dilation_attr,
+      .ceil_mode = ceil_mode,
+  };
+
+  const bool has_dynamic_ceil_pad =
+      HasDynamicCeilModePadding(input_shape, window_params);
+
+  mlir::MlirOp scatter_operand = tail_info.operand;
+  std::vector<std::optional<mlir::MlirOp>> orig_runtime_sizes(total_num_dims);
+  const Dimensions orig_bounds = GetStaticShape(tail_info.operand);
+
+  if (has_dynamic_ceil_pad) {
+    for (int64_t dim = 0; dim < total_num_dims; ++dim) {
+      if (input_shape.isDynamicDim(dim)) {
+        orig_runtime_sizes[dim] =
+            mlir::stablehlo::GetDimensionSize(batch_input, dim);
+      }
+    }
+    mlir::Attribute max_val_attr =
+        GetMaxPoolInitValueAttr(element_type, builder.getOpBuilder());
+    mlir::DenseElementsAttr max_init_attr = mlir::DenseElementsAttr::get(
+        mlir::RankedTensorType::get({}, element_type), max_val_attr);
+    mlir::MlirOp max_init_value =
+        mlir::stablehlo::Constant(builder, max_init_attr);
+    scatter_operand = PadDynamicCeilModeSpatialDims(
+        tail_info.operand, max_init_value, batch_input, window_params);
+  }
+
   auto select_results = mlir::stablehlo::SelectAndScatter(
-      /*operand=*/tail_info.operand,
+      /*operand=*/scatter_operand,
       /*source=*/batch_grad_output,
       /*init_value=*/init_value, select_body, scatter_body,
       reduce_window_attributes.window_dimensions,
       reduce_window_attributes.window_strides,
       reduce_window_attributes.padding);
+
+  if (has_dynamic_ceil_pad) {
+    const Dimensions padded_bounds = GetStaticShape(select_results);
+    if (padded_bounds != orig_bounds) {
+      const Dimensions slice_starts(total_num_dims, 0);
+      const Dimensions slice_limits = orig_bounds;
+      const Dimensions slice_strides(total_num_dims, 1);
+      select_results = mlir::stablehlo::Slice(select_results, slice_starts,
+                                              slice_limits, slice_strides);
+    }
+    for (int64_t dim = 0; dim < total_num_dims; ++dim) {
+      if (orig_runtime_sizes[dim].has_value()) {
+        select_results = mlir::stablehlo::SetDimensionSize(
+            select_results, *orig_runtime_sizes[dim], dim);
+      }
+    }
+  }
 
   mlir::MlirOp batch_result =
       PadUncoveredSpatialTail(select_results, init_value, tail_info);

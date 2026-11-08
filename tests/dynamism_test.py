@@ -1250,6 +1250,360 @@ class DynamismTest(seed_test_utils.RepeatableTest):
       act = compiled(small.to(self.device), w)
     utils.assert_close(act.to("cpu"), fn(small, args[1]))
 
+  def test_pooling_ceil_mode_stride_one_dynamic_spatial(self):
+    # Regression for signed integer overflow in CeilModePadding when ceil_mode
+    # is True with stride=1 on a bounded dynamic spatial dimension, and for
+    # ScaleAvgPoolOutput Case C (count_include_pad=False,
+    # divisor_override=None) on bounded dynamic shapes.
+    mark_spatial_2d = lambda x: dynamism.mark_dynamic(x, 2, 2, 12)
+    for dtype in (torch.float32, torch.float64):
+      for shape in ((1, 3, 9, 9), (1, 3, 6, 9)):
+        x = torch.randn(shape, dtype=dtype)
+        act = self._run_bounded_dynamism_test(
+            lambda t: torch.nn.functional.avg_pool2d(
+                t,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                ceil_mode=True,
+                count_include_pad=False,
+                divisor_override=2,
+            ),
+            mark_spatial_2d,
+            x,
+        )
+        dyn_info = dynamism.get_dynamism_info(act)
+        self.assertLen(dyn_info, 1)
+        self.assertEqual(dyn_info[0].dimension, 2)
+        self.assertEqual(dyn_info[0].upper_bound, 12)
+
+    x_f32 = torch.randn(1, 3, 9, 9, dtype=torch.float32)
+    self._run_bounded_dynamism_test(
+        lambda t: torch.nn.functional.avg_pool2d(
+            t,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            ceil_mode=True,
+            count_include_pad=False,
+        ),
+        mark_spatial_2d,
+        x_f32,
+    )
+    self._run_bounded_dynamism_test(
+        lambda t: torch.nn.functional.max_pool2d(
+            t, kernel_size=3, stride=1, padding=1, ceil_mode=True
+        ),
+        mark_spatial_2d,
+        x_f32,
+    )
+
+    x_1d = torch.randn(1, 3, 9, dtype=torch.float32)
+    self._run_bounded_dynamism_test(
+        lambda t: torch.nn.functional.avg_pool1d(
+            t,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            ceil_mode=True,
+            count_include_pad=False,
+        ),
+        lambda x: dynamism.mark_dynamic(x, 2, 2, 12),
+        x_1d,
+    )
+
+  def test_avg_pool2d_ceil_mode_asymmetric_pad_dynamic_batch(self):
+    # For H=W=6, K=3, S=2, P=1, ceil_mode=True adds extra right padding
+    # (2 vs 1) and exercises ScaleAvgPoolOutput Case B with dynamic batch.
+    for batch_size in (3, 5):
+      x = torch.randn(batch_size, 2, 6, 6, dtype=torch.float32)
+      self._run_bounded_dynamism_test(
+          lambda t: torch.nn.functional.avg_pool2d(
+              t,
+              kernel_size=3,
+              stride=2,
+              padding=1,
+              ceil_mode=True,
+              count_include_pad=True,
+          ),
+          lambda t: dynamism.mark_dynamic(t, 0, 2, 8),
+          x,
+      )
+
+  def test_pooling_ceil_mode_stride_gt_one_dynamic_spatial(self):
+    # Exercises dynamic spatial ceil_mode=True with stride > 1 across:
+    # - odd upper bound (max=7, static bound extra_pad=0) vs even runtime size
+    #   (H=6, runtime extra_pad=1) with negative values to catch pad-value leaks
+    # - even upper bound (max=12, static bound extra_pad=1) across H in (6, 7)
+    for max_h in (7, 12):
+      for h in (6, 7):
+        x_neg = -torch.rand(1, 2, h, 6, dtype=torch.float32) - 1.0
+        self._run_bounded_dynamism_test(
+            lambda t: torch.nn.functional.max_pool2d(
+                t, kernel_size=3, stride=2, padding=1, ceil_mode=True
+            ),
+            lambda t, mh=max_h: dynamism.mark_dynamic(t, 2, 4, mh),
+            x_neg,
+        )
+        for count_include_pad in (True, False):
+          self._run_bounded_dynamism_test(
+              lambda t, cip=count_include_pad: torch.nn.functional.avg_pool2d(
+                  t,
+                  kernel_size=3,
+                  stride=2,
+                  padding=1,
+                  ceil_mode=True,
+                  count_include_pad=cip,
+              ),
+              lambda t, mh=max_h: dynamism.mark_dynamic(t, 2, 4, mh),
+              x_neg,
+          )
+
+        # 1D pooling with stride=2 and ceil_mode=True on dynamic spatial dim
+        x_1d_neg = -torch.rand(1, 2, h, dtype=torch.float32) - 1.0
+        self._run_bounded_dynamism_test(
+            lambda t: torch.nn.functional.max_pool1d(
+                t, kernel_size=3, stride=2, padding=1, ceil_mode=True
+            ),
+            lambda t, mh=max_h: dynamism.mark_dynamic(t, 2, 4, mh),
+            x_1d_neg,
+        )
+        for count_include_pad in (True, False):
+          self._run_bounded_dynamism_test(
+              lambda t, cip=count_include_pad: torch.nn.functional.avg_pool1d(
+                  t,
+                  kernel_size=3,
+                  stride=2,
+                  padding=1,
+                  ceil_mode=True,
+                  count_include_pad=cip,
+              ),
+              lambda t, mh=max_h: dynamism.mark_dynamic(t, 2, 4, mh),
+              x_1d_neg,
+          )
+
+        # 3D pooling with stride=2 and ceil_mode=True on dynamic spatial dim
+        x_3d_neg = -torch.rand(1, 2, h, 6, 6, dtype=torch.float32) - 1.0
+        self._run_bounded_dynamism_test(
+            lambda t: torch.nn.functional.max_pool3d(
+                t, kernel_size=3, stride=2, padding=1, ceil_mode=True
+            ),
+            lambda t, mh=max_h: dynamism.mark_dynamic(t, 2, 4, mh),
+            x_3d_neg,
+        )
+        for count_include_pad in (True, False):
+          self._run_bounded_dynamism_test(
+              lambda t, cip=count_include_pad: torch.nn.functional.avg_pool3d(
+                  t,
+                  kernel_size=3,
+                  stride=2,
+                  padding=1,
+                  ceil_mode=True,
+                  count_include_pad=cip,
+              ),
+              lambda t, mh=max_h: dynamism.mark_dynamic(t, 2, 4, mh),
+              x_3d_neg,
+          )
+
+    # - sliding-window boundary guard (K=4, S=4, P=2): H in (5, 6) drops the
+    #   trailing padding-only window (last_start=8 >= H+P), while H=7 keeps it.
+    for h in (5, 6, 7):
+      x = torch.randn(1, 2, h, 6, dtype=torch.float32)
+      self._run_bounded_dynamism_test(
+          lambda t: torch.nn.functional.avg_pool2d(
+              t,
+              kernel_size=4,
+              stride=4,
+              padding=2,
+              ceil_mode=True,
+              count_include_pad=True,
+          ),
+          lambda t: dynamism.mark_dynamic(t, 2, 4, 9),
+          x,
+      )
+
+  def test_max_pool_backward_ceil_mode_stride_gt_one_dynamic_spatial(self):
+    # Exercises backward pass for max_pool1d, max_pool2d, max_pool3d with
+    # ceil_mode=True and stride > 1 on bounded dynamic spatial dimensions.
+    def max_pool1d_bwd(t):
+      t_req = t.detach().clone().requires_grad_(True)
+      out = torch.nn.functional.max_pool1d(
+          t_req, kernel_size=3, stride=2, padding=1, ceil_mode=True
+      )
+      out.backward(torch.ones_like(out))
+      return t_req.grad
+
+    def max_pool2d_bwd(t):
+      t_req = t.detach().clone().requires_grad_(True)
+      out = torch.nn.functional.max_pool2d(
+          t_req, kernel_size=3, stride=2, padding=1, ceil_mode=True
+      )
+      out.backward(torch.ones_like(out))
+      return t_req.grad
+
+    def max_pool3d_bwd(t):
+      t_req = t.detach().clone().requires_grad_(True)
+      out = torch.nn.functional.max_pool3d(
+          t_req, kernel_size=3, stride=2, padding=1, ceil_mode=True
+      )
+      out.backward(torch.ones_like(out))
+      return t_req.grad
+
+    for max_dim in (7, 12):
+      for cur_dim in (6, 7):
+        x_1d = torch.randn(1, 2, cur_dim, dtype=torch.float32)
+        act_1d = self._run_bounded_dynamism_test(
+            max_pool1d_bwd,
+            lambda t, md=max_dim: dynamism.mark_dynamic(t, 2, 4, md),
+            x_1d,
+        )
+        dyn_1d = dynamism.get_dynamism_info(act_1d)
+        self.assertLen(dyn_1d, 1)
+        self.assertEqual(dyn_1d[0].dimension, 2)
+        self.assertEqual(dyn_1d[0].upper_bound, max_dim)
+
+        x_2d = torch.randn(1, 2, cur_dim, 6, dtype=torch.float32)
+        act_2d = self._run_bounded_dynamism_test(
+            max_pool2d_bwd,
+            lambda t, md=max_dim: dynamism.mark_dynamic(t, 2, 4, md),
+            x_2d,
+        )
+        dyn_2d = dynamism.get_dynamism_info(act_2d)
+        self.assertLen(dyn_2d, 1)
+        self.assertEqual(dyn_2d[0].dimension, 2)
+        self.assertEqual(dyn_2d[0].upper_bound, max_dim)
+
+        x_3d = torch.randn(1, 2, cur_dim, 6, 6, dtype=torch.float32)
+        act_3d = self._run_bounded_dynamism_test(
+            max_pool3d_bwd,
+            lambda t, md=max_dim: dynamism.mark_dynamic(t, 2, 4, md),
+            x_3d,
+        )
+        dyn_3d = dynamism.get_dynamism_info(act_3d)
+        self.assertLen(dyn_3d, 1)
+        self.assertEqual(dyn_3d[0].dimension, 2)
+        self.assertEqual(dyn_3d[0].upper_bound, max_dim)
+
+  def test_avg_pool_backward_ceil_mode_stride_gt_one_dynamic_spatial(self):
+    # Exercises backward pass for avg_pool1d, avg_pool2d, avg_pool3d with
+    # ceil_mode=True and stride > 1 on bounded dynamic spatial dimensions.
+    for count_include_pad in (True, False):
+
+      def avg_pool1d_bwd(t, cip=count_include_pad):
+        t_req = t.detach().clone().requires_grad_(True)
+        out = torch.nn.functional.avg_pool1d(
+            t_req,
+            kernel_size=3,
+            stride=2,
+            padding=1,
+            ceil_mode=True,
+            count_include_pad=cip,
+        )
+        out.backward(torch.ones_like(out))
+        return t_req.grad
+
+      def avg_pool2d_bwd(t, cip=count_include_pad):
+        t_req = t.detach().clone().requires_grad_(True)
+        out = torch.nn.functional.avg_pool2d(
+            t_req,
+            kernel_size=3,
+            stride=2,
+            padding=1,
+            ceil_mode=True,
+            count_include_pad=cip,
+        )
+        out.backward(torch.ones_like(out))
+        return t_req.grad
+
+      def avg_pool3d_bwd(t, cip=count_include_pad):
+        t_req = t.detach().clone().requires_grad_(True)
+        out = torch.nn.functional.avg_pool3d(
+            t_req,
+            kernel_size=3,
+            stride=2,
+            padding=1,
+            ceil_mode=True,
+            count_include_pad=cip,
+        )
+        out.backward(torch.ones_like(out))
+        return t_req.grad
+
+      for max_dim in (7, 12):
+        for cur_dim in (6, 7):
+          x_1d = torch.randn(1, 2, cur_dim, dtype=torch.float32)
+          act_1d = self._run_bounded_dynamism_test(
+              avg_pool1d_bwd,
+              lambda t, md=max_dim: dynamism.mark_dynamic(t, 2, 4, md),
+              x_1d,
+          )
+          dyn_1d = dynamism.get_dynamism_info(act_1d)
+          self.assertLen(dyn_1d, 1)
+          self.assertIn(dyn_1d[0].dimension, (2, 3))
+          self.assertEqual(dyn_1d[0].upper_bound, max_dim)
+
+          x_2d = torch.randn(1, 2, cur_dim, 6, dtype=torch.float32)
+          act_2d = self._run_bounded_dynamism_test(
+              avg_pool2d_bwd,
+              lambda t, md=max_dim: dynamism.mark_dynamic(t, 2, 4, md),
+              x_2d,
+          )
+          dyn_2d = dynamism.get_dynamism_info(act_2d)
+          self.assertLen(dyn_2d, 1)
+          self.assertEqual(dyn_2d[0].dimension, 2)
+          self.assertEqual(dyn_2d[0].upper_bound, max_dim)
+
+          x_3d = torch.randn(1, 2, cur_dim, 6, 6, dtype=torch.float32)
+          act_3d = self._run_bounded_dynamism_test(
+              avg_pool3d_bwd,
+              lambda t, md=max_dim: dynamism.mark_dynamic(t, 2, 4, md),
+              x_3d,
+          )
+          dyn_3d = dynamism.get_dynamism_info(act_3d)
+          self.assertLen(dyn_3d, 1)
+          self.assertEqual(dyn_3d[0].dimension, 2)
+          self.assertEqual(dyn_3d[0].upper_bound, max_dim)
+
+  def test_pooling_ceil_mode_compiled_dynamic_spatial(self):
+    # Exercises torch.compile forward and backward on avg_pool2d with
+    # ceil_mode=True and dynamic spatial dimensions, verifying reuse
+    # without recompilation.
+    def avg_pool_fwd(t):
+      return torch.nn.functional.avg_pool2d(
+          t,
+          kernel_size=3,
+          stride=2,
+          padding=1,
+          ceil_mode=True,
+          count_include_pad=False,
+      )
+
+    x_cpu = torch.randn(1, 2, 12, 10, dtype=torch.float32, requires_grad=True)
+    expected = avg_pool_fwd(x_cpu)
+    expected.backward(torch.ones_like(expected))
+    expected_grad = x_cpu.grad.clone()
+
+    x_tpu = x_cpu.detach().clone().to(self.device).requires_grad_(True)
+    torch._dynamo.mark_dynamic(x_tpu, 2)
+    compiled_fn = torch.compile(avg_pool_fwd, backend="tpu", dynamic=None)
+    act = compiled_fn(x_tpu)
+    act.backward(torch.ones_like(act))
+    utils.assert_close(act.to("cpu"), expected)
+    utils.assert_close(x_tpu.grad.to("cpu"), expected_grad)
+
+    small_cpu = torch.randn(
+        1, 2, 7, 10, dtype=torch.float32, requires_grad=True
+    )
+    expected_small = avg_pool_fwd(small_cpu)
+    expected_small.backward(torch.ones_like(expected_small))
+    expected_small_grad = small_cpu.grad.clone()
+
+    small_tpu = small_cpu.detach().clone().to(self.device).requires_grad_(True)
+    with torch._dynamo.config.patch(error_on_recompile=True):
+      act_small = compiled_fn(small_tpu)
+      act_small.backward(torch.ones_like(act_small))
+    utils.assert_close(act_small.to("cpu"), expected_small)
+    utils.assert_close(small_tpu.grad.to("cpu"), expected_small_grad)
+
 
 if __name__ == "__main__":
   absltest.main()
