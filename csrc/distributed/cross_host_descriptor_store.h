@@ -36,8 +36,7 @@ class CrossHostDescriptorStore {
       : publish_store_(std::move(store)),
         read_store_(publish_store_->clone()) {}
 
-  std::vector<std::vector<uint8_t>> Get(
-      const std::vector<std::string>& keys) {
+  std::vector<std::vector<uint8_t>> Get(const std::vector<std::string>& keys) {
     return read_store_->multiGet(keys);
   }
 

@@ -84,9 +84,8 @@ TEST_P(CrossHostDescriptorStoreTest, PublishWhileWaitingForDownstream) {
     prefix += "pg/";
   }
   CrossHostDescriptorStore descriptors(store);
-  auto read = std::async(std::launch::async, [&] {
-    return descriptors.Get({"downstream"});
-  });
+  auto read = std::async(std::launch::async,
+                         [&] { return descriptors.Get({"downstream"}); });
   // Do not use a fatal assertion: always release the reader and join workers.
   const auto started = read_started.wait_for(5s);
   auto publish = std::async(std::launch::async, [&] {
@@ -126,7 +125,7 @@ TEST_P(CrossHostDescriptorStoreTest, TCPStorePreservesDescriptorNamespace) {
 }
 
 INSTANTIATE_TEST_SUITE_P(PrefixDepth, CrossHostDescriptorStoreTest,
-                        testing::Values(0, 2));
+                         testing::Values(0, 2));
 
 }  // namespace
 }  // namespace torch_tpu
